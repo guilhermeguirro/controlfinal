@@ -7,12 +7,14 @@ on:
       - 'dev/**'
       - 'staging/**'
       - 'prod/**'
+      - '.github/workflows/**'
   pull_request:
     branches: [ "main" ]
     paths:
       - 'dev/**'
       - 'staging/**'
       - 'prod/**'
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       environment:
@@ -31,14 +33,19 @@ permissions:
 env:
   TF_LOG: INFO
   AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: true
+  TERRAFORM_VERSION: "1.5.0"
 
 jobs:
   validate:
     name: "Validate"
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
     defaults:
       run:
-        working-directory: ./${{ github.event.inputs.environment || 'dev' }}
+        working-directory: ./${{ matrix.environment }}
 
     steps:
       - name: Checkout
@@ -47,7 +54,7 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: "1.5.0"
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
 
       - name: Terraform Format
         id: fmt
@@ -60,16 +67,24 @@ jobs:
 
       - name: Terraform Validate
         id: validate
-        run: terraform validate
+        run: terraform validate -no-color
 
-  dev-deploy:
-    name: "Dev Deployment"
+  deploy:
+    name: "${{ matrix.environment }} Deployment"
     needs: validate
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == matrix.environment)
     runs-on: ubuntu-latest
-    environment: dev
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+    environment: ${{ matrix.environment }}
+    concurrency: ${{ matrix.environment }}
     defaults:
       run:
-        working-directory: ./dev
+        working-directory: ./${{ matrix.environment }}
 
     steps:
       - name: Checkout
@@ -85,15 +100,18 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: "1.5.0"
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
 
       - name: Terraform Init
         id: init
-        run: terraform init
+        run: |
+          terraform init -input=false
+        continue-on-error: false
 
       - name: Terraform Plan
         id: plan
-        run: terraform plan -no-color -out=tfplan
+        run: |
+          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan 2>&1 | tee plan.txt
         continue-on-error: true
 
       - name: Update Pull Request
@@ -104,10 +122,17 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const output = `#### Terraform Dev Plan 📖
-            \`\`\`terraform\n
-            ${process.env.PLAN}
-            \`\`\``;
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            const output = `#### Terraform Plan for ${process.env.ENVIRONMENT} 📖
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+            
+            </details>`;
+            
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -115,76 +140,20 @@ jobs:
               body: output
             })
 
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve tfplan
-
-  staging-deploy:
-    name: "Staging Deployment"
-    needs: dev-deploy
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    environment: staging
-    defaults:
-      run:
-        working-directory: ./staging
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: AWS Authentication
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: "1.5.0"
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Plan
-        run: terraform plan -no-color -out=tfplan
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
 
       - name: Terraform Apply
-        run: terraform apply -auto-approve tfplan
+        if: |
+          github.ref == 'refs/heads/main' && 
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          steps.plan.outcome == 'success'
+        run: |
+          terraform apply -auto-approve -input=false tfplan
 
-  prod-deploy:
-    name: "Production Deployment"
-    needs: staging-deploy
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    environment: prod
-    defaults:
-      run:
-        working-directory: ./prod
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: AWS Authentication
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: "1.5.0"
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Plan
-        run: terraform plan -no-color -out=tfplan
-
-      - name: Terraform Apply
-        run: terraform apply -auto-approve tfplan
+      - name: Cleanup Terraform Files
+        if: always()
+        run: |
+          rm -rf .terraform*
+          rm -f tfplan plan.txt
